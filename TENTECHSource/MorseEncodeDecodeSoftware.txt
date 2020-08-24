@@ -1,0 +1,781 @@
+	1	 +/*          MORSE ENDECODER
+ 	2	 + 
+ 	3	 + - Morse encoder / decoder classes for the Arduino.
+ 	4	 +
+ 	5	 + Copyright (C) 2010-2012 raron
+ 	6	 +
+ 	7	 + GNU GPLv3 license:
+ 	8	 +
+ 	9	 + This program is free software: you can redistribute it and/or modify
+ 	10	 + it under the terms of the GNU General Public License as published by
+ 	11	 + the Free Software Foundation, either version 3 of the License, or
+ 	12	 + (at your option) any later version.
+ 	13	 + 
+ 	14	 + This program is distributed in the hope that it will be useful,
+ 	15	 + but WITHOUT ANY WARRANTY; without even the implied warranty of
+ 	16	 + MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ 	17	 + GNU General Public License for more details.
+ 	18	 + 
+ 	19	 + You should have received a copy of the GNU General Public License
+ 	20	 + along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ 	21	 + 
+ 	22	 +
+ 	23	 + Contact: raronzen@gmail.com
+ 	24	 + Details: http://raronoff.wordpress.com/2010/12/16/morse-endecoder/
+ 	25	 +
+ 	26	 + TODO:
+ 	27	 + - have this table in PROGMEM! DONE!
+ 	28	 + - Get rid of debounce for keying input - *NOT DONE* was needed!
+ 	29	 + - Use micros() for faster timings
+ 	30	 + - use different defines for different morse code tables, up to including 9-signal SOS etc
+ 	31	 + - Speed auto sense? (unlikely, but would be nice).
+ 	32	 + - Serial command parser example sketch (to change speed and settings etc) 
+ 	33	 + - LOOK AT UNDERSCORE SEND-BUG (is sent as questionmark)! *DONE* Fixed!
+ 	34	 + 
+ 	35	 +
+ 	36	 + History:
+ 	37	 + 2012.11.22 - Debugged the _underscore_ problem, it got "uppercased" to a
+ 	38	 +                question mark. Also, included ampersand (&)
+ 	39	 + 2012.11.20 - Finally moved table to PROGMEM! Cleaned up header comments a bit.
+ 	40	 + 2012.11.10 - Fixed minor bug: pinMode for the Morse output pin (thanks Rezoss!)
+ 	41	 + 2012.01.31 - Tiny update for Arduino 1.0. Fixed header comments.
+ 	42	 + 2010.12.06 - Cleaned up code a bit.
+ 	43	 +                Added the "MN digraph" ---. for alternate exclamation mark(!).
+ 	44	 +                Still encoded as the "KW digraph" -.-.-- though.
+ 	45	 + 2010.12.04 - Program changed to use (Decode and Encode) classes instead.
+ 	46	 + 2010.12.02 - Changed back to signed timers to avoid overflow.
+ 	47	 + 2010.11.30 - Morse punctuation added (except $ - the dollar sign).
+ 	48	 + 2010.11.29 - Added echo on/off command.
+ 	49	 + 2010.11.28 - Added simple Morse audio clipping filter + Command parser.
+ 	50	 + 2010.11.27 - Added Morse encoding via reverse-dichotomic path tracing.
+ 	51	 +                Thus using the same Morse tree for encoding and decoding.
+ 	52	 + 2010.11.11 - Complete Rewrite for the Arduino.
+ 	53	 + 1992.01.06 - My old rather unknown "Morse decoder 3.5" for Amiga 600.
+ 	54	 +                A 68000 Assembler version using a binary tree for Morse
+ 	55	 +                decoding only, of which this is based on.
+ 	56	 +*/ 
+ 	57	 +
+ 	58	 +#include "MorseEnDecoder.h"
+ 	59	 +
+	
+ 	60	 +// Morse code binary tree table (or, dichotomic search table)
+ 	61	 +
+ 	62	 +// ITU - International Morse code table only
+ 	63	 +//const int morseTreetop = 31;
+ 	64	 +//char morseTable[] = "5H4S?V3I?F?U??2E?L?R???A?P?W?J1 6B?D?X?N?C?K?Y?T7Z?G?Q?M8??O9?0";
+ 	65	 +
+ 	66	 +
+ 	67	 +// ITU with punctuation (but without non-english characters - for now)
+ 	68	 +const int morseTreetop = 63;
+ 	69	 +char morseTable[] PROGMEM = "*5*H*4*S***V*3*I***F***U?*_**2*E*&*L\"**R*+.****A***P@**W***J'1* *6-B*=*D*/"
+ 	70	 +                    "*X***N***C;*!K*()Y***T*7*Z**,G***Q***M:8*!***O*9***0*";
+ 	71	 +
+ 	72	 +
+ 	73	 +const int morseTableLength = (morseTreetop*2)+1;
+ 	74	 +const int morseTreeLevels = log(morseTreetop+1)/log(2);
+ 	75	 +
+ 	76	 +
+ 	77	 +
+ 	78	 +morseDecoder::morseDecoder(int decodePin, boolean listenAudio, boolean morsePullup)
+ 	79	 +{
+ 	80	 +  morseInPin = decodePin;
+ 	81	 +  morseAudio = listenAudio;
+ 	82	 +  activeLow = morsePullup;
+ 	83	 +
+ 	84	 +  if (morseAudio == false)
+ 	85	 +  {
+ 	86	 +    pinMode(morseInPin, INPUT);
+ 	87	 +    if (activeLow) digitalWrite (morseInPin, HIGH);
+ 	88	 +  }
+ 	89	 +
+ 	90	 +  // Some initial values  
+ 	91	 +  wpm = 13;
+ 	92	 +  AudioThreshold = 700;
+ 	93	 +  debounceDelay = 20;
+ 	94	 +  dotTime = 1200 / wpm;       // morse dot time length in ms
+ 	95	 +  dashTime = 3 * 1200 / wpm;
+ 	96	 +  wordSpace = 7 * 1200 / wpm;
+ 	97	 +
+ 	98	 +  morseTableJumper = (morseTreetop+1)/2;
+ 	99	 +  morseTablePointer = morseTreetop;
+ 	100	 + 
+ 	101	 +  morseKeyer = LOW;
+ 	102	 +  morseSignalState = LOW;
+ 	103	 +  lastKeyerState = LOW;
+ 	104	 +
+ 	105	 +  gotLastSig = true;
+ 	106	 +  morseSpace = true;
+ 	107	 +  decodedMorseChar = '\0';
+ 	108	 +  
+ 	109	 +  lastDebounceTime = 0;
+ 	110	 +  markTime = 0;
+ 	111	 +  spaceTime = 0;
+ 	112	 +}
+ 	113	 +
+ 	114	 +
+ 	115	 +
+ 	116	 +void morseDecoder::setspeed(int value)
+ 	117	 +{
+ 	118	 +  wpm = value;
+ 	119	 +  if (wpm <= 0) wpm = 1;
+ 	120	 +  dotTime = 1200 / wpm;
+ 	121	 +  dashTime = 3 * 1200 / wpm;
+ 	122	 +  wordSpace = 7 * 1200 / wpm;
+ 	123	 +}
+ 	124	 +
+ 	125	 +
+ 	126	 +
+ 	127	 +boolean morseDecoder::available()
+ 	128	 +{
+ 	129	 +  if (decodedMorseChar) return true; else return false;
+ 	130	 +}
+ 	131	 +
+ 	132	 +
+ 	133	 +
+ 	134	 +char morseDecoder::read()
+ 	135	 +{
+ 	136	 +  char temp = decodedMorseChar;
+ 	137	 +  decodedMorseChar = '\0';
+ 	138	 +  return temp;
+ 	139	 +}
+ 	140	 +
+ 	141	 +
+ 	142	 +
+ 	143	 +
+ 	144	 +
+ 	145	 +morseEncoder::morseEncoder(int encodePin)
+ 	146	 +{
+ 	147	 +  morseOutPin = encodePin;
+ 	148	 +  pinMode(morseOutPin, OUTPUT);
+ 	149	 +
+ 	150	 +  // some initial values
+ 	151	 +  digitalWrite (morseOutPin, LOW);
+ 	152	 +  sendingMorse = false;
+ 	153	 +  encodeMorseChar = '\0';
+ 	154	 +
+ 	155	 +  wpm = 13;
+ 	156	 +  dotTime = 1200 / wpm;       // morse dot time length in ms
+ 	157	 +  dashTime = 3 * 1200 / wpm;
+ 	158	 +  wordSpace = 7 * 1200 / wpm;
+ 	159	 + 
+ 	160	 +}
+ 	161	 +
+ 	162	 +
+ 	163	 +
+ 	164	 +void morseEncoder::setspeed(int value)
+ 	165	 +{
+ 	166	 +  wpm = value;
+ 	167	 +  if (wpm <= 0) wpm = 1;
+ 	168	 +  dotTime = 1200 / wpm;
+ 	169	 +  dashTime = 3 * 1200 / wpm;
+ 	170	 +  wordSpace = 7 * 1200 / wpm;
+ 	171	 +}
+ 	172	 +
+ 	173	 +
+ 	174	 +
+ 	175	 +boolean morseEncoder::available()
+ 	176	 +{
+ 	177	 +  if (sendingMorse) return false; else return true;
+ 	178	 +}
+ 	179	 +
+ 	180	 +
+ 	181	 +
+ 	182	 +void morseEncoder::write(char temp)
+ 	183	 +{
+ 	184	 +  if (!sendingMorse && temp != '*') encodeMorseChar = temp;
+ 	185	 +}
+ 	186	 +
+ 	187	 +
+ 	188	 +
+ 	189	 + 
+ 	190	 +
+ 	191	 +void morseDecoder::decode()
+ 	192	 +{
+ 	193	 +  currentTime = millis();
+ 	194	 +  
+ 	195	 +  // Read Morse signals
+ 	196	 +  if (morseAudio == false)
+ 	197	 +  {
+ 	198	 +    // Read the Morse keyer (digital)
+ 	199	 +    morseKeyer = digitalRead(morseInPin);
+ 	200	 +    if (activeLow) morseKeyer = !morseKeyer;
+ 	201	 +
+ 	202	 +    // If the switch changed, due to noise or pressing:
+ 	203	 +    if (morseKeyer != lastKeyerState) lastDebounceTime = currentTime; // reset timer
+ 	204	 +  
+ 	205	 +    // debounce the morse keyer
+ 	206	 +    if ((currentTime - lastDebounceTime) > debounceDelay)
+ 	207	 +    {
+ 	208	 +      // whatever the reading is at, it's been there for longer
+ 	209	 +      // than the debounce delay, so take it as the actual current state:
+ 	210	 +      morseSignalState = morseKeyer;
+ 	211	 +      
+ 	212	 +      // differentiante mark and space times
+ 	213	 +      if (morseSignalState) markTime = lastDebounceTime; 
+ 	214	 +      else spaceTime = lastDebounceTime;
+ 	215	 +    }
+ 	216	 +  } else {
+ 	217	 +    // Read Morse audio signal
+ 	218	 +    audioSignal = analogRead(morseInPin);
+ 	219	 +    if (audioSignal > AudioThreshold)
+ 	220	 +    {
+ 	221	 +      // If this is a new morse signal, reset morse signal timer
+ 	222	 +      if (currentTime - lastDebounceTime > dotTime/2)
+ 	223	 +      {
+ 	224	 +        markTime = currentTime;
+ 	225	 +        morseSignalState = true; // there is currently a Morse signal
+ 	226	 +      }
+ 	227	 +      lastDebounceTime = currentTime;
+ 	228	 +    } else {
+ 	229	 +      // if this is a new pause, reset space time
+ 	230	 +      if (currentTime - lastDebounceTime > dotTime/2 && morseSignalState == true)
+ 	231	 +      {
+ 	232	 +        spaceTime = lastDebounceTime; // not too far off from last received audio
+ 	233	 +        morseSignalState = false;     // No more signal
+ 	234	 +      }
+ 	235	 +    }
+ 	236	 +  }
+ 	237	 +  
+ 	238	 +
+ 	239	 +
+ 	240	 +  // Decode morse code
+ 	241	 +  if (!morseSignalState)
+ 	242	 +  {
+ 	243	 +    if (!gotLastSig)
+ 	244	 +    {
+ 	245	 +      if (morseTableJumper > 0)
+ 	246	 +      {
+ 	247	 +        // if pause for more than half a dot, get what kind of signal pulse (dot/dash) received last
+ 	248	 +        if (currentTime - spaceTime > dotTime/2)
+ 	249	 +        {
+ 	250	 +          // if signal for more than 1/4 dotTime, take it as a morse pulse
+ 	251	 +          if (spaceTime-markTime > dotTime/4)
+ 	252	 +          {
+ 	253	 +            // if signal for less than half a dash, take it as a dot
+ 	254	 +            if (spaceTime-markTime < dashTime/2)
+ 	255	 +            {
+ 	256	 +               morseTablePointer -= morseTableJumper;
+ 	257	 +               morseTableJumper /= 2;
+ 	258	 +               gotLastSig = true;
+ 	259	 +            }
+ 	260	 +            // else if signal for between half a dash and a dash + one dot (1.33 dashes), take as a dash
+ 	261	 +            else if (spaceTime-markTime < dashTime + dotTime)
+ 	262	 +            {
+ 	263	 +              morseTablePointer += morseTableJumper;
+ 	264	 +              morseTableJumper /= 2;
+ 	265	 +              gotLastSig = true;
+ 	266	 +            }
+ 	267	 +          }
+ 	268	 +        }
+ 	269	 +      } else { // error if too many pulses in one morse character
+ 	270	 +        //Serial.println("<ERROR: unrecognized signal!>");
+ 	271	 +        decodedMorseChar = '#'; // error mark
+ 	272	 +        gotLastSig = true;
+ 	273	 +        morseTableJumper = (morseTreetop+1)/2;
+ 	274	 +        morseTablePointer = morseTreetop;
+ 	275	 +      }
+ 	276	 +    }
+ 	277	 +    // Write out the character if pause is longer than 2/3 dash time (2 dots) and a character received
+ 	278	 +    if ((currentTime-spaceTime >= (dotTime*2)) && (morseTableJumper < ((morseTreetop+1)/2)))
+ 	279	 +    {
+ 	280	 +      decodedMorseChar = pgm_read_byte_near(morseTable + morseTablePointer);
+ 	281	 +      morseTableJumper = (morseTreetop+1)/2;
+ 	282	 +      morseTablePointer = morseTreetop;
+ 	283	 +    }
+ 	284	 +    // Write a space if pause is longer than 2/3rd wordspace
+ 	285	 +    if (currentTime-spaceTime > (wordSpace*2/3) && morseSpace == false)
+ 	286	 +    {
+ 	287	 +      //Serial.print(" ");
+ 	288	 +      decodedMorseChar = ' ';
+ 	289	 +      morseSpace = true ; // space written-flag
+ 	290	 +    }
+ 	291	 +
+ 	292	 +  } else {
+ 	293	 +    // while there is a signal, reset some flags
+ 	294	 +    gotLastSig = false;
+ 	295	 +    morseSpace = false;
+ 	296	 +  }
+ 	297	 +  
+ 	298	 +  // Save the morse keyer state for next round
+ 	299	 +  lastKeyerState = morseKeyer;
+ 	300	 +}
+ 	301	 +
+ 	302	 +
+ 	303	 +
+ 	304	 +
+ 	305	 +
+ 	306	 +
+ 	307	 +
+ 	308	 +void morseEncoder::encode()
+ 	309	 +{
+ 	310	 +  currentTime = millis();
+ 	311	 +
+ 	312	 +  if (!sendingMorse && encodeMorseChar)
+ 	313	 +  {
+ 	314	 +    // change to capital letter if not
+ 	315	 +    if (encodeMorseChar > 96) encodeMorseChar -= 32;
+ 	316	 +  
+ 	317	 +    // Scan for the character to send in the Morse table
+ 	318	 +    int i;
+ 	319	 +    for (i=0; i<morseTableLength; i++) if (pgm_read_byte_near(morseTable + i) == encodeMorseChar) break;
+ 	320	 +    int morseTablePos = i+1;  // 1-based position
+ 	321	 +  
+ 	322	 +    // Reverse dichotomic / binary tree path tracing
+ 	323	 +  
+ 	324	 +    // Find out what level in the binary tree the character is
+ 	325	 +    int test;
+ 	326	 +    for (i=0; i<morseTreeLevels; i++)
+ 	327	 +    {
+ 	328	 +      test = (morseTablePos + (0x0001 << i)) % (0x0002 << i);
+ 	329	 +      if (test == 0) break;
+ 	330	 +    }
+ 	331	 +    int startLevel = i;
+ 	332	 +    morseSignals = morseTreeLevels - i; // = the number of dots and/or dashes
+ 	333	 +    morseSignalPos = 0;
+ 	334	 +  
+ 	335	 +    // Travel the reverse path to the top of the morse table
+ 	336	 +    if (morseSignals > 0)
+ 	337	 +    {
+ 	338	 +      // build the morse signal (backwards from last signal to first)
+ 	339	 +      for (i = startLevel; i<morseTreeLevels; i++)
+ 	340	 +      {
+ 	341	 +        int add = (0x0001 << i);
+ 	342	 +        test = (morseTablePos + add) / (0x0002 << i);
+ 	343	 +        if (test & 0x0001 == 1)
+ 	344	 +        {
+ 	345	 +          morseTablePos += add;
+ 	346	 +          // Add a dot to the temporary morse signal string
+ 	347	 +          morseSignalString[morseSignals-1 - morseSignalPos++] = '.';
+ 	348	 +        } else {
+ 	349	 +          morseTablePos -= add;
+ 	350	 +          // Add a dash to the temporary morse signal string
+ 	351	 +          morseSignalString[morseSignals-1 - morseSignalPos++] = '-';
+ 	352	 +        }
+ 	353	 +      }
+ 	354	 +    } else {  // unless it was on the top to begin with (A space character)
+ 	355	 +      morseSignalString[0] = ' ';
+ 	356	 +      morseSignalPos = 1;
+ 	357	 +      morseSignals = 1; // cheating a little; a wordspace for a "morse signal"
+ 	358	 +    }
+ 	359	 +    morseSignalString[morseSignalPos] = '\0';
+ 	360	 +  
+ 	361	 +  /*
+ 	362	 +    if (morseTablePos-1 != morseTreetop)
+ 	363	 +    {
+ 	364	 +      Serial.println();
+ 	365	 +      Serial.print("..Hm..error? MorseTablePos = ");
+ 	366	 +      Serial.println(morseTablePos); 
+ 	367	 +    }
+ 	368	 +  */
+ 	369	 +  
+ 	370	 +    // start sending the the character
+ 	371	 +    sendingMorse = true;
+ 	372	 +    sendingMorseSignalNr = 0;
+ 	373	 +    sendMorseTimer = currentTime;
+ 	374	 +    if (morseSignalString[0] != ' ') digitalWrite(morseOutPin, HIGH);
+ 	375	 +  }
+ 	376	 +
+ 	377	 +
+ 	378	 +  // Send Morse signals to output
+ 	379	 +  if (sendingMorse)
+ 	380	 +  {
+ 	381	 +    switch (morseSignalString[sendingMorseSignalNr])
+ 	382	 +    {
+ 	383	 +      case '.': // Send a dot (actually, stop sending a signal after a "dot time")
+ 	384	 +        if (currentTime - sendMorseTimer >= dotTime)
+ 	385	 +        {
+ 	386	 +          digitalWrite(morseOutPin, LOW);
+ 	387	 +          sendMorseTimer = currentTime;
+ 	388	 +          morseSignalString[sendingMorseSignalNr] = 'x'; // Mark the signal as sent
+ 	389	 +        }
+ 	390	 +        break;
+ 	391	 +      case '-': // Send a dash (same here, stop sending after a dash worth of time)
+ 	392	 +        if (currentTime - sendMorseTimer >= dashTime)
+ 	393	 +        {
+ 	394	 +          digitalWrite(morseOutPin, LOW);
+ 	395	 +          sendMorseTimer = currentTime;
+ 	396	 +          morseSignalString[sendingMorseSignalNr] = 'x'; // Mark the signal as sent
+ 	397	 +        }
+ 	398	 +        break;
+ 	399	 +      case 'x': // To make sure there is a pause between signals and letters
+ 	400	 +        if (sendingMorseSignalNr < morseSignals-1)
+ 	401	 +        {
+ 	402	 +          // Pause between signals in the same letter
+ 	403	 +          if (currentTime - sendMorseTimer >= dotTime)
+ 	404	 +          {
+ 	405	 +            sendingMorseSignalNr++;
+ 	406	 +            digitalWrite(morseOutPin, HIGH); // Start sending the next signal
+ 	407	 +            sendMorseTimer = currentTime;       // reset the timer
+ 	408	 +          }
+ 	409	 +        } else {
+ 	410	 +          // Pause between letters
+ 	411	 +          if (currentTime - sendMorseTimer >= dashTime)
+ 	412	 +          {
+ 	413	 +            sendingMorseSignalNr++;
+ 	414	 +            sendMorseTimer = currentTime;       // reset the timer
+ 	415	 +          }
+ 	416	 +        }
+ 	417	 +        break;
+ 	418	 +      case ' ': // Pause between words (minus pause between letters - already sent)
+ 	419	 +      default:  // Just in case its something else
+ 	420	 +        if (currentTime - sendMorseTimer > wordSpace - dashTime) sendingMorseSignalNr++;
+ 	421	 +    }
+ 	422	 +    if (sendingMorseSignalNr >= morseSignals)
+ 	423	 +    {
+ 	424	 +      // Ready to encode more letters
+ 	425	 +      sendingMorse = false;
+ 	426	 +      encodeMorseChar = '\0';
+ 	427	 +    }
+ 	428	 +  }
+ 	429	 +}
+ 	430	 +
+ 	431	 +
+ 	432	 +
+ 	433	 +
+ 	434	 +
+ 	435	 +
+ 	436	 +
+ 	437	 +
+ 	438	 +
+ 	439	 +
+ 	440	 +
+ 	441	 +
+ 	442	 +
+ 	443	 +
+80 ????? lib/Morse_EnDecoder/MorseEnDecoder.h View file @ 5a843cc
+...	...	 @@ -0,0 +1,80 @@
+ 	1	 +#ifndef MorseEnDecoder_H
+ 	2	 +#define MorseEnDecoder_H
+ 	3	 +
+ 	4	 +#if (ARDUINO <  100)
+ 	5	 +#include <WProgram.h>
+ 	6	 +#else
+ 	7	 +#include <Arduino.h>
+ 	8	 +#endif
+ 	9	 +
+ 	10	 +#define MORSE_AUDIO true
+ 	11	 +#define MORSE_KEYER false
+ 	12	 +#define MORSE_ACTIVE_LOW true
+ 	13	 +#define MORSE_ACTIVE_HIGH false
+ 	14	 +
+ 	15	 +
+ 	16	 +class morseDecoder
+ 	17	 +{
+ 	18	 +  public:
+ 	19	 +    morseDecoder(int decodePin, boolean listenAudio, boolean morsePullup);
+ 	20	 +    void decode();
+ 	21	 +    void setspeed(int value);
+ 	22	 +    char read();
+ 	23	 +    boolean available();
+ 	24	 +    int AudioThreshold;
+ 	25	 +    long debounceDelay;     // the debounce time. Keep well below dotTime!!
+ 	26	 +    boolean morseSignalState;  
+ 	27	 +  private:
+ 	28	 +    int morseInPin;         // The Morse input pin
+ 	29	 +    int audioSignal;
+ 	30	 +    int morseTableJumper;
+ 	31	 +    int morseTablePointer;
+ 	32	 +    int wpm;                // Word-per-minute speed
+ 	33	 +    long dotTime;           // morse dot time length in ms
+ 	34	 +    long dashTime;
+ 	35	 +    long wordSpace;
+ 	36	 +    boolean morseSpace;     // Flag to prevent multiple received spaces
+ 	37	 +    boolean gotLastSig;     // Flag that the last received morse signal is decoded as dot or dash
+ 	38	 +    boolean morseKeyer;
+ 	39	 +    boolean lastKeyerState;
+ 	40	 +    boolean morseAudio;
+ 	41	 +    boolean activeLow;
+ 	42	 +    long markTime;          // timers for mark and space in morse signal
+ 	43	 +    long spaceTime;         // E=MC^2 ;p
+ 	44	 +    long lastDebounceTime;  // the last time the input pin was toggled
+ 	45	 +    long currentTime;       // The current (signed) time
+ 	46	 +    char decodedMorseChar;  // The last decoded Morse character
+ 	47	 +};
+ 	48	 +
+ 	49	 +
+ 	50	 +
+ 	51	 +
+ 	52	 +class morseEncoder
+ 	53	 +{
+ 	54	 +  public:
+ 	55	 +    morseEncoder(int encodePin);
+ 	56	 +    void encode();
+ 	57	 +    void setspeed(int value);
+ 	58	 +    void write(char temp);
+ 	59	 +    boolean available();
+ 	60	 +    char morseSignalString[7];// Morse signal for one character as temporary ASCII string of dots and dashes
+ 	61	 +  private:
+ 	62	 +    char encodeMorseChar;   // ASCII character to encode
+ 	63	 +    int morseOutPin;
+ 	64	 +    boolean sendingMorse;
+ 	65	 +    int wpm;                // Word-per-minute speed
+ 	66	 +    long dotTime;           // morse dot time length in ms
+ 	67	 +    long dashTime;
+ 	68	 +    long wordSpace;
+ 	69	 +    int morseSignals;       // nr of morse signals to send in one morse character
+ 	70	 +    int morseSignalPos;
+ 	71	 +    int sendingMorseSignalNr;
+ 	72	 +    long sendMorseTimer;
+ 	73	 +    long lastDebounceTime;
+ 	74	 +    long currentTime;
+ 	75	 +};
+ 	76	 +
+ 	77	 +
+ 	78	 +#endif
+ 	79	 +
+ 	80	 +
+67 ????? lib/Morse_EnDecoder/examples/Morse_EnDecoder_barebones/Morse_EnDecoder_barebones.ino View file @ 5a843cc
+...	...	 @@ -0,0 +1,67 @@
+ 	1	 +/*
+ 	2	 +           MORSE ENDECODER BAREBONES
+ 	3	 +
+ 	4	 +  Minimum sketch to send/receive Morse code via the serial monitor.
+ 	5	 +
+ 	6	 +  This example decodes Morse signals present on digital input 7
+ 	7	 +    (active low, and then also using the internal pullup resistor).
+ 	8	 +  It also encodes Morse sent via the serial interface to the Arduino,
+ 	9	 +    on digital output pin 13.
+ 	10	 +
+ 	11	 +  Copyright (C) 2010, 2012 raron
+ 	12	 +  GNU GPLv3 license (http://www.gnu.org/licenses)
+ 	13	 +  Contact: raronzen@gmail.com  (not checked too often..)
+ 	14	 +  Details: http://raronoff.wordpress.com/2010/12/16/morse-endecoder/
+ 	15	 +*/
+ 	16	 +
+ 	17	 +#include <avr/pgmspace.h>
+ 	18	 +#include <MorseEnDecoder.h>
+ 	19	 +
+ 	20	 +// Pin mapping
+ 	21	 +const byte morseInPin = 7;      
+ 	22	 +const byte morseOutPin = 13;
+ 	23	 +
+ 	24	 +// Instantiate Morse objects
+ 	25	 +morseDecoder morseInput(morseInPin, MORSE_KEYER, MORSE_ACTIVE_LOW);
+ 	26	 +morseEncoder morseOutput(morseOutPin);
+ 	27	 +
+ 	28	 +void setup()
+ 	29	 +{
+ 	30	 +  Serial.begin(9600);
+ 	31	 +  Serial.println("Morse EnDecoder barebones demo");
+ 	32	 +  
+ 	33	 +  // Setting Morse speed in wpm - words per minute
+ 	34	 +  // If not set, 13 wpm is default anyway
+ 	35	 +  morseInput.setspeed(13);
+ 	36	 +  morseOutput.setspeed(13);
+ 	37	 +}
+ 	38	 +
+ 	39	 +
+ 	40	 +void loop()
+ 	41	 +{
+ 	42	 +  // Need to call these once per loop
+ 	43	 +  morseInput.decode();
+ 	44	 +  morseOutput.encode();
+ 	45	 +
+ 	46	 +  // SEND MORSE (OUTPUT)
+ 	47	 +  // Encode and send text received from the serial port (serial monitor)
+ 	48	 +  if (Serial.available() && morseOutput.available())
+ 	49	 +  {
+ 	50	 +    // Get character from serial and send as Morse code
+ 	51	 +    char sendMorse = Serial.read();
+ 	52	 +    morseOutput.write(sendMorse);
+ 	53	 +  }
+ 	54	 +
+ 	55	 +  // RECEIVE MORSE (INPUT)
+ 	56	 +  // If a character is decoded from the input, write it to serial port
+ 	57	 +  if (morseInput.available())
+ 	58	 +  {
+ 	59	 +    char receivedMorse = morseInput.read();
+ 	60	 +    Serial.print(receivedMorse);
+ 	61	 +    
+ 	62	 +    // A little error checking    
+ 	63	 +    if (receivedMorse == '#') Serial.println("< ERROR:too many morse signals! >");
+ 	64	 +  }
+ 	65	 +
+ 	66	 +}
+ 	67	 +
+148 ????? lib/Morse_EnDecoder/examples/Morse_EnDecoder_demo/Morse_EnDecoder_demo.ino View file @ 5a843cc
+...	...	 @@ -0,0 +1,148 @@
+ 	1	 +/*
+ 	2	 +                MORSE ENDECODER DEMO
+ 	3	 +
+ 	4	 +  Demonstrates using Morse encoder and decoder classes for the Arduino.
+ 	5	 +
+ 	6	 +  Local Morse code feedback to both serial and Morse output (unless sending 
+ 	7	 +    at the same time as receiving or keying in morse), for morse training demo.
+ 	8	 +  Formatted serial port output - Serial monitor looks a bit nicer.
+ 	9	 +
+ 	10	 +
+ 	11	 +  This example decodes Morse code signals with a speed of 13 WPM present on
+ 	12	 +    digital input 7 (active low, and also using the internal pullup resistor).
+ 	13	 +
+ 	14	 +  It also encodes Morse code sent via the serial interface to the Arduino,
+ 	15	 +    on digital output pin 13. Speed is 13 WPM also (easily changed in code).
+ 	16	 +  
+ 	17	 +  It can also decode audible signals, if using the constant MORSE_AUDIO
+ 	18	 +    instead of MORSE_KEYER, but then it is important to note that the
+ 	19	 +    input pin nr. will be for ANALOG inputs (0-5 on Atmega 168 - 328),
+ 	20	 +    and not the digital inputs.
+ 	21	 +
+ 	22	 +
+ 	23	 +
+ 	24	 +  Copyright (C) 2010, 2012 raron
+ 	25	 +  
+ 	26	 +  GNU GPLv3 license:
+ 	27	 +  
+ 	28	 +  This program is free software: you can redistribute it and/or modify
+ 	29	 +  it under the terms of the GNU General Public License as published by
+ 	30	 +  the Free Software Foundation, either version 3 of the License, or
+ 	31	 +  (at your option) any later version.
+ 	32	 +   
+ 	33	 +  This program is distributed in the hope that it will be useful,
+ 	34	 +  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ 	35	 +  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ 	36	 +  GNU General Public License for more details.
+ 	37	 +   
+ 	38	 +  You should have received a copy of the GNU General Public License
+ 	39	 +  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ 	40	 +   
+ 	41	 +  
+ 	42	 +  Contact: raronzen@gmail.com  (not checked too often..)
+ 	43	 +  Details: http://raronoff.wordpress.com/2010/12/16/morse-endecoder/
+ 	44	 +*/
+ 	45	 +
+ 	46	 +#include <avr/pgmspace.h>
+ 	47	 +#include <MorseEnDecoder.h>
+ 	48	 +
+ 	49	 +// Pin mappings
+ 	50	 +const byte morseInPin = 7;      
+ 	51	 +const byte morseOutPin = 13;
+ 	52	 +
+ 	53	 +// Instantiate Morse objects
+ 	54	 +morseDecoder morseInput(morseInPin, MORSE_KEYER, MORSE_ACTIVE_LOW);
+ 	55	 +morseEncoder morseOutput(morseOutPin);
+ 	56	 +
+ 	57	 +// Variables dealing with formatting the output somewhat
+ 	58	 +// by inserting CR's (carriage returns)
+ 	59	 +long lastTransmissionTime;
+ 	60	 +long currentTime;
+ 	61	 +boolean transmissionEnded = true; // Flag to mark old transmission is finished
+ 	62	 +
+ 	63	 +// Minimum transmission pause time to insert carriage returns (CR)
+ 	64	 +// Adjust depending on Morse speed. IE 13 wpm = 646 ms between words (no CR).
+ 	65	 +const long transmissionPaused   = 1000; // Suitable for 13 wpm?
+ 	66	 +
+ 	67	 +
+ 	68	 +void setup()
+ 	69	 +{
+ 	70	 +  Serial.begin(9600);
+ 	71	 +  Serial.println("Morse EnDecoder demo");
+ 	72	 +  
+ 	73	 +  // Setting Morse speed in wpm - words per minute
+ 	74	 +  // If not set, 13 wpm is default anyway
+ 	75	 +  morseInput.setspeed(13);
+ 	76	 +  morseOutput.setspeed(13);
+ 	77	 +  
+ 	78	 +  lastTransmissionTime = (long)millis();
+ 	79	 +}
+ 	80	 +
+ 	81	 +
+ 	82	 +
+ 	83	 +void loop()
+ 	84	 +{
+ 	85	 +  currentTime = (long)millis();
+ 	86	 +  
+ 	87	 +  // Needs to call these once per loop
+ 	88	 +  morseInput.decode();
+ 	89	 +  morseOutput.encode();
+ 	90	 +
+ 	91	 +  // SEND MORSE (OUTPUT)
+ 	92	 +  // Encode and send text received from the serial port (serial monitor)
+ 	93	 +  if (Serial.available() && morseOutput.available())
+ 	94	 +  {
+ 	95	 +    // Get character from serial and send as Morse code
+ 	96	 +    char sendMorse = Serial.read();
+ 	97	 +    morseOutput.write(sendMorse);
+ 	98	 +    
+ 	99	 +    // Not strictly needed, but used to get morseSignalString before it is destroyed
+ 	100	 +    // (E.g. for morse training purposes)
+ 	101	 +    morseOutput.encode();
+ 	102	 +
+ 	103	 +    // Also write sent character + Morse code to serial port/monitor
+ 	104	 +    Serial.write(' ');
+ 	105	 +    Serial.write(sendMorse);
+ 	106	 +    Serial.write(morseOutput.morseSignalString);
+ 	107	 +  }
+ 	108	 +
+ 	109	 +
+ 	110	 +  // RECEIVE MORSE (INPUT)
+ 	111	 +  // If a character is decoded from the input, write it to serial port
+ 	112	 +  if (morseInput.available())
+ 	113	 +  {
+ 	114	 +    // Get decoded Morse code character and write it to serial port/monitor
+ 	115	 +    char receivedMorse = morseInput.read();
+ 	116	 +    Serial.print(receivedMorse);
+ 	117	 +    
+ 	118	 +    // A little error checking    
+ 	119	 +    if (receivedMorse == '#') Serial.println("< ERROR:too many morse signals! >");
+ 	120	 +  }
+ 	121	 +
+ 	122	 +
+ 	123	 +  // Local Morse code feedback from input if not sending Morse simultaneously
+ 	124	 +  if (morseOutput.available()) digitalWrite(morseOutPin, morseInput.morseSignalState);
+ 	125	 +
+ 	126	 +
+ 	127	 +  // Check if ongoing transmission (not yet transmission pause)
+ 	128	 +  if (!morseOutput.available() || morseInput.morseSignalState == true)
+ 	129	 +  {
+ 	130	 +    // reset last transmission timer and flag
+ 	131	 +    lastTransmissionTime = currentTime;
+ 	132	 +    transmissionEnded = false;
+ 	133	 +  }
+ 	134	 +
+ 	135	 +  // Format output with carriage returns after a transmission pause
+ 	136	 +  if ((currentTime - lastTransmissionTime) > transmissionPaused)
+ 	137	 +  {
+ 	138	 +    if (transmissionEnded == false)
+ 	139	 +    {
+ 	140	 +      // Separate the transmissions somewhat in the serial monitor with CR's
+ 	141	 +      for (int cr=0; cr<2; cr++) Serial.println("");  // some carriage returns..
+ 	142	 +      
+ 	143	 +      // Finally set the flag to prevent continous carriage returns
+ 	144	 +      transmissionEnded = true;
+ 	145	 +    }
+ 	146	 +  }
+ 	147	 +}
+ 	148	 +
+31 ????? lib/Morse_EnDecoder/keywords.txt View file @ 5a843cc
+...	...	 @@ -0,0 +1,31 @@
+ 	1	 +#######################################
+ 	2	 +# Syntax Coloring Map For MorseEnDecoder
+ 	3	 +#######################################
+ 	4	 +
+ 	5	 +#######################################
+ 	6	 +# Datatypes (KEYWORD1)
+ 	7	 +#######################################
+ 	8	 +
+ 	9	 +morseDecoder  KEYWORD1
+ 	10	 +morseEncoder  KEYWORD1
+ 	11	 +
+ 	12	 +#######################################
+ 	13	 +# Methods and Functions (KEYWORD2)
+ 	14	 +#######################################
+ 	15	 +decode  KEYWORD2
+ 	16	 +encode  KEYWORD2
+ 	17	 +setspeed  KEYWORD2
+ 	18	 +read  KEYWORD2
+ 	19	 +write  KEYWORD2
+ 	20	 +available  KEYWORD2
+ 	21	 +
+ 	22	 +
+ 	23	 +#######################################
+ 	24	 +# Constants (LITERAL1)
+ 	25	 +#######################################
+ 	26	 +
+ 	27	 +MORSE_AUDIO  LITERAL1
+ 	28	 +MORSE_KEYER  LITERAL1
+ 	29	 +MORSE_ACTIVE_LOW  LITERAL1
+ 	30	 +MORSE_ACTIVE_HIGH  LITERAL1
+ 	31	 +
+0 notes on commit 5a843cc Show line notes below
+Please sign in to comment.
+Status API Training Shop Blog About © 2013 GitHub, Inc. Terms Privacy Security Contact 

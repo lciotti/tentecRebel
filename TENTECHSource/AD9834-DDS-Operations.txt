@@ -1,0 +1,164 @@
+/* ------------------------ Ten-Tec Rebel 506 DDS Functions --------------------------------
+
+	Annotations by James M. Lynes, Jr. August 8, 2013
+	(/Projects/chipKIT-sketches/TTRebel506/Rebel-20130804/AD9834-DDS-Operations.txt)
+
+	From the AD9834 Datasheet and Application Note AN-1070:
+
+	Output_Frequency = (Frequency_Register * Frequency_Master_Clock) / 2 ** 28
+	and / or
+	Frequency_Register = (Output_Frequency * 2 ** 28) / Frequency_Master_Clock
+
+	Frequency_Master_Clock = 49.99975 MHz determined by crystal SM77H
+
+	2 ** 28 = 268435456
+
+	Therefore, Frequency_Register = Output_Frequency * 268435456 / 49999750
+
+ ----------------------------------------------------------------------------------------
+
+	AD9834 Defines
+
+	#define SDATA_BIT                           10          //  Serial Data Pin
+	#define SCLK_BIT                            8           //  Serial Clock Pin
+	#define FSYNC_BIT                           9           //  Chip Enable Pin
+	#define RESET_BIT                           11          //  Chip Reset Pin
+	#define FREQ_REGISTER_BIT                   12          //  Freq Register Select Pin
+
+	#define AD9834_FREQ0_REGISTER_SELECT_BIT    0x4000      //  Freq0 Control Register Address
+	#define AD9834_FREQ1_REGISTER_SELECT_BIT    0x8000      //  Freq1 Control Register Address
+	#define FREQ0_INIT_VALUE                    0x01320000  //  37.35332 MHz, 37.5 MHz max
+
+	const long meter_40             = 16.03e6;		// IF_freq + Band frequency, 
+         	                                   		// HI side injection 40 meter 
+         	                                    		// range 16 > 16.3 mhz
+	const long meter_20             = 5.06e6;   		// Band frequency - IF_freq, LOW 
+                                               			// side injection 20 meter 
+                                                		// range 5 > 5.35 mhz
+	const long Reference            = 49.99975e6;  		// for ad9834 this may be 
+                                               			// tweaked in software to 
+                                               			// fine tune the Radio
+ -------------------------------------------------------------------------------------------
+
+	Programming the ad9834
+
+	The chip must be reset after power up(POR). The reset doesn't clear the Phase, Frequency,
+		or Control registers. Control register bits are in an indeterminate
+		state at power up and should be set to known values. Other internal
+		registers are set to 0 and the output is set to mid-scale.
+
+	Bits 15 and 14 (and 13 on Phase registers) of the 16 bit Control register are defined:
+		0x0xxx Control Register
+		0x4xxx Frequency 0 Register
+		0x8xxx Frequency 1 Register
+		0xCxxx Phase Register 0
+		0xExxx Phase Register 1
+
+	Bit 13 0x2xxx sets two-word transfer mode
+
+	Bit 9  0x02xx sets Pin functions(hardware) rather than Bit functions(software)
+
+	Bit 8  0x01xx sets Bit mode(software) reset
+
+	Output is disabled when Reset is high. Output is enabled when Reset goes low.
+	SCLK can idle either high or low.
+	The chip ignores everything until FSYNC (chip select) goes low.
+
+	To write to a Register:
+		FSYNC starts high		// Chip starts deselected
+		Set RESET High			// Disable output, zero registers as stated above
+		Set SCLK high			// Idle Clock high
+		Set FSYNC low			// Select the chip
+		Set a SDATA bit 0 or 1		// Output a bit			<
+		Set SCLK low			// Strobe the clock low		< Repeat for 16 bits
+		Set SCLK high			// to high			<
+		Set FSYNC high			// Deselect the chip
+		Set RESET low			// Enable Output
+		
+*/
+
+//----------------------- Set Freq 0 Function ------------------------------------------------
+void program_freq0(long frequency) {				// Frequency Register 0
+
+    int flow,fhigh;
+    AD9834_reset_high();					// Set RESET high, disable output
+    fcalc = frequency*(268.435456e6 / Reference );		// Calculate Frequency Word-28 bits
+    flow = fcalc&0x3fff;             				// Mask low word  
+    fhigh = (fcalc>>14)&0x3fff;					// Shift and Mask high word
+    digitalWrite(FSYNC_BIT, LOW);				// Select the chip
+    clock_data_to_ad9834(flow|AD9834_FREQ0_REGISTER_SELECT_BIT);// Send low word
+    clock_data_to_ad9834(fhigh|AD9834_FREQ0_REGISTER_SELECT_BIT);// Send high word
+    digitalWrite(FSYNC_BIT, HIGH);				// Deselect the chip
+    AD9834_reset_low();						// Enable output
+}
+
+//--------------------- Set Freq 1 Function ------------------------------------------------------  
+void program_freq1(long frequency) {				// Frequency Register 1
+
+    int flow,fhigh;
+    AD9834_reset_high();					// Set RESET high, disable output
+    fcalc = frequency*(268.435456e6 / Reference );		// Calculate Frequency word-28 bits
+    flow = fcalc&0x3fff;             				// Mask low word   
+    fhigh = (fcalc>>14)&0x3fff;					// Shift and Mask high word
+    digitalWrite(FSYNC_BIT, LOW);				// Select the chip  
+    clock_data_to_ad9834(flow|AD9834_FREQ1_REGISTER_SELECT_BIT);// Send low word
+    clock_data_to_ad9834(fhigh|AD9834_FREQ1_REGISTER_SELECT_BIT);// Send high word
+    digitalWrite(FSYNC_BIT, HIGH);				// Deselect the chip  
+    AD9834_reset_low();						// Enable output
+}  
+
+//-------------------- Write to DDS Chip Function --------------------------------------------------
+void clock_data_to_ad9834(unsigned int data_word) {		// Bit-Bang 16 bits to the AD9834
+								// B15 & B14 Register Address
+								// Bits 13-0 data
+    char bcount;
+    unsigned int iData;
+    iData=data_word;
+
+    digitalWrite(SCLK_BIT, HIGH);				// Idle the clock high  
+
+    for(bcount=0;bcount<16;bcount++) {				// Loop for 16 data bits
+    
+        if((iData & 0x8000)) digitalWrite(SDATA_BIT, HIGH);  	// Set a 1 data bit
+        else  digitalWrite(SDATA_BIT, LOW);			// Set a 0 data bit  
+        digitalWrite(SCLK_BIT, LOW);				// Strobe the clock low  
+        digitalWrite(SCLK_BIT, HIGH);				// to high
+        iData = iData<<1; 					// shift the word 1 bit to the left
+    }
+}
+
+//--------------------- Initialize DDS Function -----------------------------------------------
+void AD9834_init() {						// set up DDS registers
+								// Do both Hardware and software resets
+								// because PIN/SW is indeterminate at POR
+
+    AD9834_reset_high();					// Hardware RESET high, disable output 
+    digitalWrite(FSYNC_BIT, LOW);				// Select the chip
+    clock_data_to_ad9834(0x2300);  				// Software RESET, two word mode, Pin funtions
+
+    clock_data_to_ad9834((FREQ0_INIT_VALUE&0x3fff)|AD9834_FREQ0_REGISTER_SELECT_BIT);		// Send low
+    clock_data_to_ad9834(((FREQ0_INIT_VALUE>>14)&0x3fff)|AD9834_FREQ0_REGISTER_SELECT_BIT);	// Send high
+    clock_data_to_ad9834(0x2200); 				// Software RESET low to enable output
+    AD9834_reset_low();						// Hardware RESET low to enable output
+    digitalWrite(FSYNC_BIT, HIGH);				// Deselect the chip  
+}
+
+//----------------------- Reset DDS Function -------------------------------------------------   
+void AD9834_reset() {						// Reset the DDS
+
+    digitalWrite(RESET_BIT, HIGH);  				// Hardware RESET high
+    for (int i=0; i <= 2048; i++);  				// small delay
+    digitalWrite(RESET_BIT, LOW);   				// Hardware RESET low
+}
+
+//----------------------- Reset DDS Low Function ------------------------------------------------
+void AD9834_reset_low() {
+
+    digitalWrite(RESET_BIT, LOW);				// Hardware RESET low
+}
+
+//----------------------- Reset DDS High Function ----------------------------------------------     
+void AD9834_reset_high() {
+  
+    digitalWrite(RESET_BIT, HIGH);				// Hardware RESET high
+}
